@@ -1,8 +1,13 @@
 package riscv
 
 import chisel3._
+import chisel3.util._
 import chisel3.util.BitPat
+import chisel3.util.BitPat._
+import chisel3.util.experimental._
 import chisel3.util.experimental.decode._
+import firrtl.annotations.{ComponentName, LoadMemoryAnnotation, MemoryFileInlineAnnotation, MemoryLoadFileType}
+
 
 
 
@@ -186,12 +191,12 @@ class ALUFN {
   def FN_MULHSU = FN_SEQ
   def FN_MULHU  = FN_SNE
 
-  //def isMulFN(fn: UInt, cmp: UInt) = fn(1,0) === cmp(1,0)
-  //def isSub(cmd: UInt) = cmd(3)
-  //def isCmp(cmd: UInt) = cmd >= FN_SLT
-  //def cmpUnsigned(cmd: UInt) = cmd(1)
-  //def cmpInverted(cmd: UInt) = cmd(0)
-  //def cmpEq(cmd: UInt) = !cmd(3)
+  def isMulFN(fn: UInt, cmp: UInt) = fn(1,0) === cmp(1,0)
+  def isSub(cmd: UInt) = cmd(3)
+  def isCmp(cmd: UInt) = cmd >= FN_SLT.value.asUInt
+  def cmpUnsigned(cmd: UInt) = cmd(1)
+  def cmpInverted(cmd: UInt) = cmd(0)
+  def cmpEq(cmd: UInt) = !cmd(3)
 }
 
 object ALUFN {
@@ -376,6 +381,255 @@ import MemoryOpConstants._
 }
 
 
-class HotChip extends Module {
+class IMem(size: Int, program: Seq[UInt] ) extends Module {
+  val io = IO(new Bundle {
+    val address = Input(UInt(log2Ceil(size).W))
+    val instruction = Output(UInt(32.W))
+  })
+  val memory = Mem(size, UInt(32.W))
+
+  //loadMemoryFromFile(memory, "src/main/resources/program.txt", MemoryLoadFileType.Binary)
+
+  program.zipWithIndex.foreach { case (instr, addr) =>
+     memory.write(addr.U, instr)
+  }
+
+  io.instruction := memory(io.address)
+}
+
+class DMem(size: Int, program: Seq[UInt] ) extends Module {
+  val io = IO(new Bundle {
+    val address = Input(UInt(log2Ceil(size).W))
+    val data = Output(UInt(32.W))
+    val writeData = Input(UInt(32.W))    
+    val writeEnable = Input(Bool())
+    val readEnable = Input(Bool())
+  })
+  val memory = Mem(size, UInt(32.W))
+
+  program.zipWithIndex.foreach { case (instr, addr) =>
+     memory.write(addr.U, instr)
+  }
+
+  io.data := Mux(io.readEnable, memory(io.address), 0.U)
+
+  when(io.writeEnable) {
+    memory.write(io.address, io.writeData)
+  }
+}
+
+
+class RegisterFile(numRegs: Int, regWidth: Int) extends Module {
+  val io = IO(new Bundle {
+    // Read ports
+    val readAddr1 = Input(UInt(log2Ceil(numRegs).W))
+    val readData1 = Output(UInt(regWidth.W))
+    val readAddr2 = Input(UInt(log2Ceil(numRegs).W))
+    val readData2 = Output(UInt(regWidth.W))
+    // Write port
+    val writeEnable = Input(Bool())
+    val writeAddr = Input(UInt(log2Ceil(numRegs).W))
+    val writeData = Input(UInt(regWidth.W))
+  })
+
+  // The register file
+  val regs = Reg(Vec(numRegs, UInt(regWidth.W)))
+
+  // Read operations
+  io.readData1 := Mux(io.readAddr1 === 0.U, 0.U, regs(io.readAddr1))
+  io.readData2 := Mux(io.readAddr2 === 0.U, 0.U, regs(io.readAddr2))
+
+  // Write operation
+  when(io.writeEnable && io.writeAddr =/= 0.U) {
+    regs(io.writeAddr) := io.writeData
+  }
+
+  printf(cf"regs: $regs\n")
+}
+
+abstract class AbstractALU[T <: ALUFN](val aluFn: T, val xLen : Int) extends Module {
+  val io = IO(new Bundle {
+    val dw = Input(UInt(1.W))
+    val fn = Input(UInt(aluFn.SZ_ALU_FN.W))
+    val in2 = Input(UInt(xLen.W))
+    val in1 = Input(UInt(xLen.W))
+    val out = Output(UInt(xLen.W))
+    val adder_out = Output(UInt(xLen.W))
+    val cmp_out = Output(Bool())
+  })
+}
+
+class ALU extends AbstractALU(new ALUFN,32) {
+  import ScalarOpConstants._
+  val usingConditionalZero = false
+  // ADD, SUB
+  val in2_inv = Mux(aluFn.isSub(io.fn), ~io.in2, io.in2)
+  val in1_xor_in2 = io.in1 ^ in2_inv
+  io.adder_out := io.in1 + in2_inv + aluFn.isSub(io.fn)
+
+  // SLT, SLTU
+  val slt =
+    Mux(io.in1(xLen-1) === io.in2(xLen-1), io.adder_out(xLen-1),
+    Mux(aluFn.cmpUnsigned(io.fn), io.in2(xLen-1), io.in1(xLen-1)))
+  io.cmp_out := aluFn.cmpInverted(io.fn) ^ Mux(aluFn.cmpEq(io.fn), in1_xor_in2 === 0.U, slt)
+
+  // SLL, SRL, SRA
+  val (shamt, shin_r) =
+    if (xLen == 32) (io.in2(4,0), io.in1)
+    else {
+      require(xLen == 64)
+      val shin_hi_32 = Fill(32, aluFn.isSub(io.fn) && io.in1(31))
+      val shin_hi = Mux(io.dw === DW_64, io.in1(63,32), shin_hi_32)
+      val shamt = Cat(io.in2(5) & (io.dw === DW_64), io.in2(4,0))
+      (shamt, Cat(shin_hi, io.in1(31,0)))
+    }
+  val shin = Mux(io.fn === aluFn.FN_SR  || io.fn === aluFn.FN_SRA, shin_r, Reverse(shin_r))
+  val shout_r = (Cat(aluFn.isSub(io.fn) & shin(xLen-1), shin).asSInt >> shamt)(xLen-1,0)
+  val shout_l = Reverse(shout_r)
+  val shout = Mux(io.fn === aluFn.FN_SR || io.fn === aluFn.FN_SRA, shout_r, 0.U) |
+              Mux(io.fn === aluFn.FN_SL,                           shout_l, 0.U)
+
+  // CZEQZ, CZNEZ
+  val in2_not_zero = io.in2.orR
+  val cond_out = Option.when(usingConditionalZero)(
+    Mux((io.fn === aluFn.FN_CZEQZ && in2_not_zero) || (io.fn === aluFn.FN_CZNEZ && !in2_not_zero), io.in1, 0.U)
+  )
+
+  // AND, OR, XOR
+  val logic = Mux(io.fn === aluFn.FN_XOR || io.fn === aluFn.FN_OR, in1_xor_in2, 0.U) |
+              Mux(io.fn === aluFn.FN_OR || io.fn === aluFn.FN_AND, io.in1 & io.in2, 0.U)
+
+  val shift_logic = (aluFn.isCmp (io.fn) && slt) | logic | shout
+  val shift_logic_cond = cond_out match {
+    case Some(co) => shift_logic | co
+    case _ => shift_logic
+  }
+  val out = Mux(io.fn === aluFn.FN_ADD || io.fn === aluFn.FN_SUB, io.adder_out, shift_logic_cond)
+
+  io.out := out
+  if (xLen > 32) {
+    require(xLen == 64)
+    when (io.dw === DW_32) { io.out := Cat(Fill(32, out(31)), out(31,0)) }
+  }
+}
+
+
+
+object ImmGen {
+  import ScalarOpConstants._
+  def apply(sel: UInt, inst: UInt) = {
+    val sign = Mux(sel === IMM_Z, 0.S, inst(31).asSInt)
+    val b30_20 = Mux(sel === IMM_U, inst(30,20).asSInt, sign)
+    val b19_12 = Mux(sel =/= IMM_U && sel =/= IMM_UJ, sign, inst(19,12).asSInt)
+    val b11 = Mux(sel === IMM_U || sel === IMM_Z, 0.S,
+              Mux(sel === IMM_UJ, inst(20).asSInt,
+              Mux(sel === IMM_SB, inst(7).asSInt, sign)))
+    val b10_5 = Mux(sel === IMM_U || sel === IMM_Z, 0.U, inst(30,25))
+    val b4_1 = Mux(sel === IMM_U, 0.U,
+               Mux(sel === IMM_S || sel === IMM_SB, inst(11,8),
+               Mux(sel === IMM_Z, inst(19,16), inst(24,21))))
+    val b0 = Mux(sel === IMM_S, inst(7),
+             Mux(sel === IMM_I, inst(20),
+             Mux(sel === IMM_Z, inst(15), 0.U)))
+
+    Cat(sign, b30_20, b19_12, b11, b10_5, b4_1, b0).asSInt
+  }
+}
+
+class ExpandedInstruction extends Bundle {
+  val bits = UInt(32.W)
+  val rd = UInt(5.W)
+  val rs1 = UInt(5.W)
+  val rs2 = UInt(5.W)
+  val rs3 = UInt(5.W)
+}
+
+class CoreMonitorBundle extends Bundle {
+  val pc = UInt(5.W)
+  val inst = UInt(32.W)
+  val alu_out = UInt(32.W)
   
+}
+
+class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
+    import ScalarOpConstants._
+    import MemoryOpConstants._
+    val io = IO(new Bundle {    
+        val monitor = Output(new CoreMonitorBundle) 
+    })
+    val decode_table = {Seq(new IDecode(aluFn = ALUFN()))} flatMap(_.table) //bu sanırım iterable yapıyor.
+    val imem = Module(new IMem(1024, program))
+    val dmem = Module(new DMem(1024, data))
+    val regfile = Module(new RegisterFile(32,32))
+    val alu = Module(new ALU())
+    val id_ctrl = Wire(new IntCtrlSigs(aluFn = ALUFN())).decode(imem.io.instruction, decode_table)
+    val imm = ImmGen(id_ctrl.sel_imm, imem.io.instruction)
+
+    val pc = RegInit(0.U(32.W))
+    val npc = pc + 1.U //full word fetch at the moment
+    imem.io.address := pc
+    val raw_inst = imem.io.instruction
+    pc := npc
+    val readData1 = regfile.io.readData1
+    val readData2 = regfile.io.readData2
+    val instruction = inst(raw_inst)
+    //ilk başta rvc decodersiz birkaç instructionu çalıştıracağım, eğer sistem çalışıyorsa rvc decoder eklerim
+    
+    val op1 = MuxLookup(id_ctrl.sel_alu1, 0.U)(Seq(
+        bitPatToUInt(A1_RS1) -> readData1,
+        bitPatToUInt(A1_PC)-> pc
+    ))
+
+    val op2 = MuxLookup(id_ctrl.sel_alu2, 0.U)(Seq(
+        bitPatToUInt(A2_RS2) -> readData2,
+        bitPatToUInt(A2_IMM) -> imm.asUInt,
+        //bitPatToUInt(A2_SIZE) -> imm.asUInt
+    ))
+    
+    def inst(bits: UInt) = {
+      val res = Wire(new ExpandedInstruction)
+      res.bits := bits
+      res.rd := bits(11,7)
+      res.rs1 := bits(19,15)
+      res.rs2 := bits(24,20)
+      res.rs3 := bits(31,27)
+      res
+    }
+    
+    regfile.io.readAddr1 := instruction.rs1
+    regfile.io.readAddr2 := instruction.rs2
+  
+    alu.io.in1 := op1
+    alu.io.in2 := op2
+    alu.io.fn := id_ctrl.alu_fn
+    alu.io.dw := id_ctrl.alu_dw
+    
+    regfile.io.writeEnable := id_ctrl.wxd
+    regfile.io.writeAddr := instruction.rd
+    regfile.io.writeData := Mux(id_ctrl.mem_cmd === M_XWR, dmem.io.data, alu.io.out)
+
+    
+    dmem.io.address := alu.io.out
+    dmem.io.writeData := readData2
+    dmem.io.writeEnable := id_ctrl.mem_cmd === M_XWR
+    dmem.io.readEnable := id_ctrl.mem_cmd === M_XRD
+    
+   
+        
+    
+
+
+    //monitoring
+    io.monitor.pc := pc
+    io.monitor.inst := raw_inst
+    io.monitor.alu_out := alu.io.out
+
+    printf(cf"pc: ${pc}, inst: ${raw_inst}%b, alu_out: ${alu.io.out}, dmem.io.data: ${dmem.io.data} \n")
+    //printf(cf"inst: $instruction\n")
+    //printf(cf"id_ctrl: $id_ctrl\n")
+}
+
+
+object Main extends App{
+  println("App runned!")
 }
