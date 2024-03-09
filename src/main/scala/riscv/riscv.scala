@@ -443,8 +443,12 @@ class RegisterFile(numRegs: Int, regWidth: Int) extends Module {
   when(io.writeEnable && io.writeAddr =/= 0.U) {
     regs(io.writeAddr) := io.writeData
   }
-
-  printf(cf"regs: $regs\n")
+  val regAsSInt = regs.map(_.asSInt)
+  printf(cf"regs: ${regs}\n")
+  //printf(cf"regAsSInt: ${regAsSInt}\n")
+  //for (i <- 0 until regAsSInt.length) {
+  //  printf(p"regAsSInt($i): ${regAsSInt(i)}\n")
+  //}
 }
 
 abstract class AbstractALU[T <: ALUFN](val aluFn: T, val xLen : Int) extends Module {
@@ -551,9 +555,11 @@ class CoreMonitorBundle extends Bundle {
   
 }
 
+
 class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
     import ScalarOpConstants._
     import MemoryOpConstants._
+    import Instructions._
     val io = IO(new Bundle {    
         val monitor = Output(new CoreMonitorBundle) 
     })
@@ -565,24 +571,36 @@ class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
     val id_ctrl = Wire(new IntCtrlSigs(aluFn = ALUFN())).decode(imem.io.instruction, decode_table)
     val imm = ImmGen(id_ctrl.sel_imm, imem.io.instruction)
 
+
+
     val pc = RegInit(0.U(32.W))
-    val npc = pc + 1.U //full word fetch at the moment
     imem.io.address := pc
-    val raw_inst = imem.io.instruction
+
+    val br_taken = alu.io.cmp_out //wire yapacağız sanrım
+    val br_target =Mux(id_ctrl.branch && br_taken, ImmGen(bitPatToUInt(IMM_SB), imem.io.instruction).asUInt,
+                          Mux(id_ctrl.jal, ImmGen(bitPatToUInt(IMM_UJ), imem.io.instruction).asUInt, 1.U))     
+    val npc = pc + br_target
     pc := npc
+    
+    val raw_inst = imem.io.instruction
     val readData1 = regfile.io.readData1
     val readData2 = regfile.io.readData2
     val instruction = inst(raw_inst)
     //ilk başta rvc decodersiz birkaç instructionu çalıştıracağım, eğer sistem çalışıyorsa rvc decoder eklerim
     
-    val op1 = MuxLookup(id_ctrl.sel_alu1, 0.U)(Seq(
-        bitPatToUInt(A1_RS1) -> readData1,
-        bitPatToUInt(A1_PC)-> pc
+
+   
+    
+    
+
+    val op1 = MuxLookup(id_ctrl.sel_alu1, 0.S)(Seq(
+        bitPatToUInt(A1_RS1) -> readData1.asSInt,
+        bitPatToUInt(A1_PC)-> pc.asSInt,
     ))
 
-    val op2 = MuxLookup(id_ctrl.sel_alu2, 0.U)(Seq(
-        bitPatToUInt(A2_RS2) -> readData2,
-        bitPatToUInt(A2_IMM) -> imm.asUInt,
+    val op2 = MuxLookup(id_ctrl.sel_alu2, 0.S)(Seq(
+        bitPatToUInt(A2_RS2) -> readData2.asSInt,
+        bitPatToUInt(A2_IMM) -> imm,
         //bitPatToUInt(A2_SIZE) -> imm.asUInt
     ))
     
@@ -599,14 +617,15 @@ class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
     regfile.io.readAddr1 := instruction.rs1
     regfile.io.readAddr2 := instruction.rs2
   
-    alu.io.in1 := op1
-    alu.io.in2 := op2
+    alu.io.in1 := op1.asUInt
+    alu.io.in2 := op2.asUInt
     alu.io.fn := id_ctrl.alu_fn
     alu.io.dw := id_ctrl.alu_dw
     
     regfile.io.writeEnable := id_ctrl.wxd
     regfile.io.writeAddr := instruction.rd
-    regfile.io.writeData := Mux(id_ctrl.mem_cmd === M_XWR, dmem.io.data, alu.io.out)
+    regfile.io.writeData := Mux(id_ctrl.mem_cmd === M_XRD && id_ctrl.mem === 1.U, dmem.io.data,
+                            Mux(id_ctrl.jal, pc + 1.U, alu.io.out)) //pc + 1 de olabilir
 
     
     dmem.io.address := alu.io.out
@@ -614,7 +633,7 @@ class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
     dmem.io.writeEnable := id_ctrl.mem_cmd === M_XWR
     dmem.io.readEnable := id_ctrl.mem_cmd === M_XRD
     
-   
+    
         
     
 
@@ -626,7 +645,11 @@ class HotChip (program : Seq[UInt], data : Seq[UInt]) extends Module {
 
     printf(cf"pc: ${pc}, inst: ${raw_inst}%b, alu_out: ${alu.io.out}, dmem.io.data: ${dmem.io.data} \n")
     //printf(cf"inst: $instruction\n")
-    //printf(cf"id_ctrl: $id_ctrl\n")
+    printf(cf"id_ctrl: $id_ctrl\n")
+    printf(cf"br_target: $br_target\n")
+    printf(cf"\n")
+    printf(cf"\n")
+    printf(cf"\n")
 }
 
 
